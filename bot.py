@@ -14,6 +14,7 @@ import json
 import os
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -26,8 +27,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-VERSION = "101"
+VERSION = "102"
 DEFAULT_STATE_PATH = "/data/outline_state.json"
+DEFAULT_SS_LOG_PATH = "/tmp/ss-server.log"
 SUPPORTED_METHODS = {
     "chacha20-ietf-poly1305",
     "aes-128-gcm",
@@ -51,6 +53,52 @@ def parse_int_env(name: str, default: int, min_value: int | None = None, max_val
     if max_value is not None:
         value = min(max_value, value)
     return value
+
+
+def tail_file(path: str, max_lines: int = 30) -> str:
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(lines[-max_lines:]) or "лог пуст"
+    except FileNotFoundError:
+        return "лог ещё не создан"
+    except Exception as e:
+        return f"не удалось прочитать лог: {e}"
+
+
+def normalize_endpoint(host_raw: str, port_raw: str, default_port: int) -> tuple[Optional[str], Optional[int]]:
+    host = (host_raw or "").strip()
+    port_text = (port_raw or "").strip()
+    if not host:
+        return None, None
+
+    # Users often paste the whole Railway endpoint into SS_PUBLIC_HOST,
+    # e.g. tcp://roundhouse.proxy.rlwy.net:11105 or roundhouse.proxy.rlwy.net:11105.
+    for prefix in ("tcp://", "ss://", "http://", "https://"):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+            break
+    host = host.strip().strip("/")
+
+    if ":" in host and not host.startswith("["):
+        maybe_host, maybe_port = host.rsplit(":", 1)
+        if maybe_port.isdigit() and not port_text:
+            host, port_text = maybe_host, maybe_port
+
+    try:
+        port = int(port_text) if port_text else default_port
+    except ValueError:
+        port = default_port
+    if not host or port < 1 or port > 65535:
+        return None, None
+    return host, port
+
+
+def tcp_proxy_internal_port() -> Optional[int]:
+    raw = getenv("RAILWAY_TCP_APPLICATION_PORT")
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
 
 
 def parse_admin_ids() -> set[int]:
@@ -125,6 +173,8 @@ class ShadowsocksService:
     def __init__(self, store: StateStore) -> None:
         self.store = store
         self.process: Optional[subprocess.Popen] = None
+        self.log_path = getenv("SS_LOG_PATH", DEFAULT_SS_LOG_PATH)
+        self.log_file = None
         self.port = parse_int_env("SS_PORT", 8388, 1, 65535)
         self.timeout = parse_int_env("SS_TIMEOUT", 300, 10, 3600)
         self.method = getenv("SS_METHOD", "chacha20-ietf-poly1305")
@@ -154,16 +204,27 @@ class ShadowsocksService:
         if self.enable_udp:
             # Railway TCP Proxy exposes TCP publicly; UDP is normally useful only on platforms that expose UDP.
             cmd.append("-u")
+        Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+        self.log_file = open(self.log_path, "ab", buffering=0)
+        self.log_file.write((f"\n--- starting ss-server on 0.0.0.0:{self.port} method={self.method} udp={self.enable_udp} ---\n").encode())
         self.process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=self.log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        time.sleep(0.2)
+        time.sleep(0.5)
         if self.process.poll() is not None:
-            raise RuntimeError("ss-server не запустился. Проверь Railway Logs.")
+            raise RuntimeError("ss-server не запустился. Последние строки лога:\n" + tail_file(self.log_path, 30))
+        self._assert_local_tcp_listen()
+
+    def _assert_local_tcp_listen(self) -> None:
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=2):
+                return
+        except Exception as e:
+            raise RuntimeError(f"ss-server запущен, но локальный порт 127.0.0.1:{self.port} не отвечает: {e}")
 
     def stop(self) -> None:
         if not self.process:
@@ -178,6 +239,12 @@ class ShadowsocksService:
                 except Exception:
                     pass
         self.process = None
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except Exception:
+                pass
+            self.log_file = None
 
     def restart(self) -> None:
         self.stop()
@@ -188,15 +255,9 @@ class ShadowsocksService:
         self.restart()
 
     def public_endpoint(self) -> tuple[Optional[str], Optional[int]]:
-        host = getenv("SS_PUBLIC_HOST") or getenv("RAILWAY_TCP_PROXY_DOMAIN")
+        host_raw = getenv("SS_PUBLIC_HOST") or getenv("RAILWAY_TCP_PROXY_DOMAIN")
         port_raw = getenv("SS_PUBLIC_PORT") or getenv("RAILWAY_TCP_PROXY_PORT")
-        if not host:
-            return None, None
-        try:
-            public_port = int(port_raw) if port_raw else self.port
-        except ValueError:
-            public_port = self.port
-        return host, public_port
+        return normalize_endpoint(host_raw, port_raw, self.port)
 
     def access_key(self) -> str:
         host, port = self.public_endpoint()
@@ -225,7 +286,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📊 Статус", callback_data="status"), InlineKeyboardButton("🏓 Ping", callback_data="ping")],
             [InlineKeyboardButton("🔁 Рестарт VPN", callback_data="restart_vpn")],
             [InlineKeyboardButton("♻️ Рестарт контейнера", callback_data="restart_container")],
-            [InlineKeyboardButton("❓ Инструкция", callback_data="help")],
+            [InlineKeyboardButton("🛠 Debug", callback_data="debug"), InlineKeyboardButton("❓ Инструкция", callback_data="help")],
         ]
     )
 
@@ -334,6 +395,15 @@ async def show_status(update: Update) -> None:
     host, port = ss.public_endpoint()
     uptime = int(time.time() - STARTED_AT)
     endpoint = f"{host}:{port}" if host and port else "TCP Proxy ещё не настроен"
+    railway_internal = tcp_proxy_internal_port()
+    warnings: list[str] = []
+    if railway_internal and railway_internal != ss.port:
+        warnings.append(
+            f"⚠️ Railway TCP Proxy смотрит на внутренний порт {railway_internal}, "
+            f"а ss-server слушает {ss.port}. В Networking → TCP Proxy поставь {ss.port} или измени SS_PORT."
+        )
+    if not host or not port:
+        warnings.append("⚠️ Нет публичного TCP endpoint. Включи TCP Proxy и сделай redeploy.")
     try:
         key_hint = ss.access_key()[:18] + "…"
     except Exception:
@@ -342,13 +412,37 @@ async def show_status(update: Update) -> None:
         "📊 <b>Статус VPN</b>\n\n"
         f"Версия: <code>{VERSION}</code>\n"
         f"VPN-процесс: <code>{'работает' if running else 'остановлен'}</code>\n"
-        f"Внутренний порт: <code>{ss.port}</code>\n"
+        f"Внутренний порт ss-server: <code>{ss.port}</code>\n"
+        f"Внутренний порт Railway TCP Proxy: <code>{railway_internal or 'нет'}</code>\n"
         f"Публичный endpoint: <code>{html.escape(endpoint)}</code>\n"
         f"Метод: <code>{html.escape(ss.method)}</code>\n"
+        f"UDP: <code>{'включён' if ss.enable_udp else 'выключен'}</code>\n"
         f"Ключ: <code>{html.escape(key_hint)}</code>\n"
         f"Uptime бота: <code>{uptime} сек.</code>"
     )
+    if warnings:
+        text += "\n\n" + "\n".join(html.escape(w) for w in warnings)
     await send_or_edit(update, text, main_keyboard())
+
+
+async def show_debug(update: Update) -> None:
+    running = ss.is_running()
+    host, port = ss.public_endpoint()
+    endpoint = f"{host}:{port}" if host and port else "нет"
+    debug = (
+        "🛠 <b>Debug</b>\n\n"
+        f"VPN-процесс: <code>{'работает' if running else 'остановлен'}</code>\n"
+        f"SS_PORT: <code>{ss.port}</code>\n"
+        f"RAILWAY_TCP_APPLICATION_PORT: <code>{html.escape(getenv('RAILWAY_TCP_APPLICATION_PORT') or 'нет')}</code>\n"
+        f"RAILWAY_TCP_PROXY_DOMAIN: <code>{html.escape(getenv('RAILWAY_TCP_PROXY_DOMAIN') or 'нет')}</code>\n"
+        f"RAILWAY_TCP_PROXY_PORT: <code>{html.escape(getenv('RAILWAY_TCP_PROXY_PORT') or 'нет')}</code>\n"
+        f"SS_PUBLIC_HOST: <code>{html.escape(getenv('SS_PUBLIC_HOST') or 'нет')}</code>\n"
+        f"SS_PUBLIC_PORT: <code>{html.escape(getenv('SS_PUBLIC_PORT') or 'нет')}</code>\n"
+        f"Endpoint в ключе: <code>{html.escape(endpoint)}</code>\n\n"
+        "<b>Последние строки ss-server:</b>\n"
+        f"<code>{html.escape(tail_file(ss.log_path, 20))}</code>"
+    )
+    await send_or_edit(update, debug, main_keyboard())
 
 
 async def do_ping(update: Update) -> None:
@@ -388,6 +482,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "restart_container":
         await send_or_edit(update, "♻️ <b>Контейнер перезапускается...</b>", None)
         asyncio.create_task(force_container_restart())
+    elif data == "debug":
+        await show_debug(update)
     elif data == "help":
         await send_or_edit(update, help_text(), main_keyboard())
 
@@ -413,6 +509,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("key", cmd_key))
     app.add_handler(CommandHandler("newkey", cmd_new_key))
+    app.add_handler(CommandHandler("debug", show_debug))
     app.add_handler(CallbackQueryHandler(callback))
     print(f"Starting bot version {VERSION}. Shadowsocks internal port: {ss.port}", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -71,7 +71,7 @@ SS_PUBLIC_PORT=11105
 - **🔑 Создать / обновить ключ** — создаёт новый пароль, перезапускает VPN. Старый ключ перестаёт работать.
 - **📋 Мой Outline-ключ** — показывает текущий ключ.
 - **📊 Статус** — показывает порт, endpoint, метод, uptime.
-- **🏓 Ping** — показывает отклик бота и версию `101`.
+- **🏓 Ping** — показывает отклик бота и версию `102`.
 - **🔁 Рестарт VPN** — перезапускает только Shadowsocks-процесс.
 - **♻️ Рестарт контейнера** — завершает процесс, Railway поднимает контейнер заново.
 - **❓ Инструкция** — краткая инструкция внутри Telegram.
@@ -107,7 +107,23 @@ STATE_PATH=/data/outline_state.json
 В логах Railway должна появиться строка:
 
 ```text
-Starting bot version 101. Shadowsocks internal port: 8388
+Starting bot version 102. Shadowsocks internal port: 8388
 ```
 
 Если `ss-server` не стартует, смотри Railway Logs.
+
+
+## Если Outline не подключается
+
+1. В Telegram нажми **📊 Статус**. Публичный endpoint должен быть вида `roundhouse.proxy.rlwy.net:11105`, а не `*.up.railway.app`.
+2. В Railway → Service → Settings → Networking → TCP Proxy внутренний порт должен совпадать с `SS_PORT`, обычно `8388`.
+3. После включения TCP Proxy сделай **Redeploy**. Иначе переменные `RAILWAY_TCP_PROXY_DOMAIN` и `RAILWAY_TCP_PROXY_PORT` могут не попасть в контейнер.
+4. Не вставляй весь `host:port` в `SS_PUBLIC_HOST` в старых версиях. В этой версии это исправлено, но безопасный вариант такой:
+
+```env
+SS_PUBLIC_HOST=roundhouse.proxy.rlwy.net
+SS_PUBLIC_PORT=11105
+```
+
+5. Держи одну реплику сервиса. При нескольких репликах Railway может балансировать TCP-соединения между контейнерами, а ключи/пароли могут различаться.
+6. Нажми **🛠 Debug** и посмотри последние строки `ss-server`.

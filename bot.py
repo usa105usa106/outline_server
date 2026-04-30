@@ -1,519 +1,489 @@
-#!/usr/bin/env python3
-"""Personal Railway Outline-compatible VPN bot.
-
-Runs a Shadowsocks server in the same Railway container and gives the owner an
-Outline-compatible ss:// access key through Telegram.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import base64
-import html
+﻿import html
 import json
 import os
 import secrets
-import signal
-import socket
 import subprocess
-import sys
 import time
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional
-from urllib.parse import quote
+from typing import Dict, Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+import telebot
+from telebot import types
 
-VERSION = "102"
-DEFAULT_STATE_PATH = "/data/outline_state.json"
-DEFAULT_SS_LOG_PATH = "/tmp/ss-server.log"
-SUPPORTED_METHODS = {
-    "chacha20-ietf-poly1305",
-    "aes-128-gcm",
-    "aes-256-gcm",
-    "xchacha20-ietf-poly1305",
-}
+VERSION = "103-ws"
+METHOD = "chacha20-ietf-poly1305"
 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
 
-def getenv(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+PUBLIC_HOST = (
+    os.getenv("WS_PUBLIC_HOST")
+    or os.getenv("PUBLIC_HOST")
+    or os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    or ""
+).strip()
 
+PUBLIC_HOST = (
+    PUBLIC_HOST
+    .replace("https://", "")
+    .replace("http://", "")
+    .rstrip("/")
+)
 
-def parse_int_env(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
-    raw = getenv(name)
-    try:
-        value = int(raw) if raw else default
-    except ValueError:
-        value = default
-    if min_value is not None:
-        value = max(min_value, value)
-    if max_value is not None:
-        value = min(max_value, value)
-    return value
+PUBLIC_PORT = int(os.getenv("PORT", "8080"))
+OUTLINE_WS_PORT = int(os.getenv("OUTLINE_WS_PORT", "9000"))
 
+STATE_DIR = Path(os.getenv("STATE_DIR", "/data"))
+if not STATE_DIR.exists():
+    STATE_DIR = Path("/tmp")
 
-def tail_file(path: str, max_lines: int = 30) -> str:
-    try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
-        return "\n".join(lines[-max_lines:]) or "лог пуст"
-    except FileNotFoundError:
-        return "лог ещё не создан"
-    except Exception as e:
-        return f"не удалось прочитать лог: {e}"
+STATE_FILE = STATE_DIR / "vpn_state_v103_ws.json"
+SERVER_CONFIG = Path("/tmp/outline-ss-server-ws.yaml")
+ACCESS_YAML = Path("/tmp/outline-access.yaml")
+NGINX_CONFIG = Path("/tmp/nginx-outline-ws.conf")
+SS_LOG = Path("/tmp/outline-ss-server.log")
+NGINX_LOG = Path("/tmp/nginx-outline.log")
 
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-def normalize_endpoint(host_raw: str, port_raw: str, default_port: int) -> tuple[Optional[str], Optional[int]]:
-    host = (host_raw or "").strip()
-    port_text = (port_raw or "").strip()
-    if not host:
-        return None, None
-
-    # Users often paste the whole Railway endpoint into SS_PUBLIC_HOST,
-    # e.g. tcp://roundhouse.proxy.rlwy.net:11105 or roundhouse.proxy.rlwy.net:11105.
-    for prefix in ("tcp://", "ss://", "http://", "https://"):
-        if host.startswith(prefix):
-            host = host[len(prefix):]
-            break
-    host = host.strip().strip("/")
-
-    if ":" in host and not host.startswith("["):
-        maybe_host, maybe_port = host.rsplit(":", 1)
-        if maybe_port.isdigit() and not port_text:
-            host, port_text = maybe_host, maybe_port
-
-    try:
-        port = int(port_text) if port_text else default_port
-    except ValueError:
-        port = default_port
-    if not host or port < 1 or port > 65535:
-        return None, None
-    return host, port
+ss_proc: Optional[subprocess.Popen] = None
+nginx_proc: Optional[subprocess.Popen] = None
 
 
-def tcp_proxy_internal_port() -> Optional[int]:
-    raw = getenv("RAILWAY_TCP_APPLICATION_PORT")
-    try:
-        return int(raw) if raw else None
-    except ValueError:
-        return None
+def _rand_password() -> str:
+    return secrets.token_urlsafe(24)
 
 
-def parse_admin_ids() -> set[int]:
-    raw = getenv("ADMIN_TELEGRAM_IDS")
-    ids: set[int] = set()
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
+def _rand_path() -> str:
+    return secrets.token_urlsafe(24).replace("-", "_")
+
+
+def load_state() -> Dict[str, str]:
+    if STATE_FILE.exists():
         try:
-            ids.add(int(part))
-        except ValueError:
-            pass
-    return ids
+            data = json.loads(STATE_FILE.read_text("utf-8"))
+        except Exception:
+            data = {}
+    else:
+        data = {}
+
+    changed = False
+
+    if not data.get("password"):
+        data["password"] = _rand_password()
+        changed = True
+
+    if not data.get("secret_path"):
+        data["secret_path"] = _rand_path()
+        changed = True
+
+    data["mode"] = "websocket"
+
+    if changed:
+        save_state(data)
+
+    return data
 
 
-@dataclass
-class State:
-    password: str
-    owners: list[int]
-    created_at: int
-    updated_at: int
+def save_state(data: Dict[str, str]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
 
-class StateStore:
-    def __init__(self, path: str) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.state = self._load()
+def build_server_yaml(state: Dict[str, str]) -> str:
+    secret = state["secret_path"]
+    password = state["password"]
 
-    def _load(self) -> State:
-        if self.path.exists():
-            try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                return State(
-                    password=str(data.get("password") or self._new_password()),
-                    owners=[int(x) for x in data.get("owners", [])],
-                    created_at=int(data.get("created_at") or int(time.time())),
-                    updated_at=int(data.get("updated_at") or int(time.time())),
-                )
-            except Exception:
-                # Broken state should not prevent the VPN from starting.
-                pass
-        now = int(time.time())
-        state = State(password=self._new_password(), owners=[], created_at=now, updated_at=now)
-        self.state = state
-        self.save()
-        return state
+    return f"""web:
+  servers:
+    - id: railway_ws
+      listen:
+        - "127.0.0.1:{OUTLINE_WS_PORT}"
 
-    @staticmethod
-    def _new_password() -> str:
-        # URL-safe, high entropy, and safe for Shadowsocks command-line usage.
-        return secrets.token_urlsafe(32)
-
-    def save(self) -> None:
-        self.state.updated_at = int(time.time())
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self.state), ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
-
-    def rotate_password(self) -> None:
-        self.state.password = self._new_password()
-        self.save()
-
-    def add_owner(self, user_id: int) -> None:
-        if user_id not in self.state.owners:
-            self.state.owners.append(user_id)
-            self.save()
+services:
+  - listeners:
+      - type: websocket-stream
+        web_server: railway_ws
+        path: "/{secret}/tcp"
+      - type: websocket-packet
+        web_server: railway_ws
+        path: "/{secret}/udp"
+    keys:
+      - id: user-1
+        cipher: {METHOD}
+        secret: "{password}"
+"""
 
 
-class ShadowsocksService:
-    def __init__(self, store: StateStore) -> None:
-        self.store = store
-        self.process: Optional[subprocess.Popen] = None
-        self.log_path = getenv("SS_LOG_PATH", DEFAULT_SS_LOG_PATH)
-        self.log_file = None
-        self.port = parse_int_env("SS_PORT", 8388, 1, 65535)
-        self.timeout = parse_int_env("SS_TIMEOUT", 300, 10, 3600)
-        self.method = getenv("SS_METHOD", "chacha20-ietf-poly1305")
-        if self.method not in SUPPORTED_METHODS:
-            self.method = "chacha20-ietf-poly1305"
-        self.enable_udp = getenv("ENABLE_UDP", "false").lower() in {"1", "true", "yes", "on"}
+def build_client_yaml(state: Dict[str, str]) -> str:
+    secret = state["secret_path"]
+    password = state["password"]
+    host = PUBLIC_HOST or "SET_RAILWAY_PUBLIC_DOMAIN"
 
-    def is_running(self) -> bool:
-        return self.process is not None and self.process.poll() is None
-
-    def start(self) -> None:
-        if self.is_running():
-            return
-        cmd = [
-            "ss-server",
-            "-s",
-            "0.0.0.0",
-            "-p",
-            str(self.port),
-            "-m",
-            self.method,
-            "-k",
-            self.store.state.password,
-            "-t",
-            str(self.timeout),
-        ]
-        if self.enable_udp:
-            # Railway TCP Proxy exposes TCP publicly; UDP is normally useful only on platforms that expose UDP.
-            cmd.append("-u")
-        Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
-        self.log_file = open(self.log_path, "ab", buffering=0)
-        self.log_file.write((f"\n--- starting ss-server on 0.0.0.0:{self.port} method={self.method} udp={self.enable_udp} ---\n").encode())
-        self.process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=self.log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        time.sleep(0.5)
-        if self.process.poll() is not None:
-            raise RuntimeError("ss-server не запустился. Последние строки лога:\n" + tail_file(self.log_path, 30))
-        self._assert_local_tcp_listen()
-
-    def _assert_local_tcp_listen(self) -> None:
-        try:
-            with socket.create_connection(("127.0.0.1", self.port), timeout=2):
-                return
-        except Exception as e:
-            raise RuntimeError(f"ss-server запущен, но локальный порт 127.0.0.1:{self.port} не отвечает: {e}")
-
-    def stop(self) -> None:
-        if not self.process:
-            return
-        if self.process.poll() is None:
-            try:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                self.process.wait(timeout=5)
-            except Exception:
-                try:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                except Exception:
-                    pass
-        self.process = None
-        if self.log_file:
-            try:
-                self.log_file.close()
-            except Exception:
-                pass
-            self.log_file = None
-
-    def restart(self) -> None:
-        self.stop()
-        self.start()
-
-    def rotate_and_restart(self) -> None:
-        self.store.rotate_password()
-        self.restart()
-
-    def public_endpoint(self) -> tuple[Optional[str], Optional[int]]:
-        host_raw = getenv("SS_PUBLIC_HOST") or getenv("RAILWAY_TCP_PROXY_DOMAIN")
-        port_raw = getenv("SS_PUBLIC_PORT") or getenv("RAILWAY_TCP_PROXY_PORT")
-        return normalize_endpoint(host_raw, port_raw, self.port)
-
-    def access_key(self) -> str:
-        host, port = self.public_endpoint()
-        if not host or not port:
-            raise RuntimeError(
-                "TCP Proxy ещё не настроен. В Railway открой Settings → Networking → TCP Proxy, "
-                f"укажи внутренний порт {self.port}, затем сделай Redeploy."
-            )
-        userinfo = f"{self.method}:{self.store.state.password}".encode("utf-8")
-        encoded = base64.urlsafe_b64encode(userinfo).decode("ascii").rstrip("=")
-        tag = quote(getenv("SS_KEY_NAME", "Railway Outline VPN"), safe="")
-        return f"ss://{encoded}@{host}:{port}/?outline=1#{tag}"
+    return f"""transport:
+  $type: tcpudp
+  tcp:
+    $type: shadowsocks
+    endpoint:
+      $type: websocket
+      url: wss://{host}/{secret}/tcp
+    cipher: {METHOD}
+    secret: "{password}"
+  udp:
+    $type: shadowsocks
+    endpoint:
+      $type: websocket
+      url: wss://{host}/{secret}/udp
+    cipher: {METHOD}
+    secret: "{password}"
+"""
 
 
-store = StateStore(getenv("STATE_PATH", DEFAULT_STATE_PATH))
-ss = ShadowsocksService(store)
-ADMIN_IDS = parse_admin_ids()
-STARTED_AT = time.time()
+def dynamic_key(state: Dict[str, str]) -> str:
+    host = PUBLIC_HOST or "SET_RAILWAY_PUBLIC_DOMAIN"
+    return f"ssconf://{host}/{state['secret_path']}/access.yaml"
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🔑 Создать / обновить ключ", callback_data="new_key")],
-            [InlineKeyboardButton("📋 Мой Outline-ключ", callback_data="my_key")],
-            [InlineKeyboardButton("📊 Статус", callback_data="status"), InlineKeyboardButton("🏓 Ping", callback_data="ping")],
-            [InlineKeyboardButton("🔁 Рестарт VPN", callback_data="restart_vpn")],
-            [InlineKeyboardButton("♻️ Рестарт контейнера", callback_data="restart_container")],
-            [InlineKeyboardButton("🛠 Debug", callback_data="debug"), InlineKeyboardButton("❓ Инструкция", callback_data="help")],
-        ]
-    )
+def write_runtime_files() -> None:
+    state = load_state()
+    secret = state["secret_path"]
+
+    SERVER_CONFIG.write_text(build_server_yaml(state), "utf-8")
+    ACCESS_YAML.write_text(build_client_yaml(state), "utf-8")
+
+    nginx = f"""
+worker_processes 1;
+daemon off;
+pid /tmp/nginx-outline.pid;
+
+events {{
+  worker_connections 1024;
+}}
+
+http {{
+  access_log /dev/stdout;
+  error_log /dev/stderr info;
+
+  map $http_upgrade $connection_upgrade {{
+    default upgrade;
+    '' close;
+  }}
+
+  server {{
+    listen 0.0.0.0:{PUBLIC_PORT};
+    server_name _;
+
+    location = /healthz {{
+      default_type text/plain;
+      return 200 "ok\\n";
+    }}
+
+    location = / {{
+      default_type text/plain;
+      return 200 "Outline WS server v{VERSION} OK\\n";
+    }}
+
+    location = /{secret}/access.yaml {{
+      default_type text/yaml;
+      add_header Access-Control-Allow-Origin "*" always;
+      add_header Cache-Control "no-store" always;
+      alias {ACCESS_YAML};
+    }}
+
+    location = /{secret}/tcp {{
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
+      proxy_set_header Host $http_host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto https;
+      proxy_read_timeout 900s;
+      proxy_send_timeout 900s;
+      proxy_pass http://127.0.0.1:{OUTLINE_WS_PORT};
+    }}
+
+    location = /{secret}/udp {{
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
+      proxy_set_header Host $http_host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto https;
+      proxy_read_timeout 900s;
+      proxy_send_timeout 900s;
+      proxy_pass http://127.0.0.1:{OUTLINE_WS_PORT};
+    }}
+  }}
+}}
+"""
+
+    NGINX_CONFIG.write_text(nginx, "utf-8")
 
 
-def user_allowed(user_id: int) -> bool:
-    if ADMIN_IDS:
-        return user_id in ADMIN_IDS
-    if not store.state.owners:
-        store.add_owner(user_id)
-        return True
-    return user_id in store.state.owners
-
-
-async def guard(update: Update) -> bool:
-    user = update.effective_user
-    if not user:
-        return False
-    if user_allowed(user.id):
-        return True
-    text = "⛔️ Доступ запрещён. Этот VPN-бот уже привязан к владельцу."
-    if update.callback_query:
-        await update.callback_query.answer(text, show_alert=True)
-    elif update.message:
-        await update.message.reply_text(text)
-    return False
-
-
-async def send_or_edit(update: Update, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
-    elif update.message:
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
-
-
-def help_text() -> str:
-    return (
-        "<b>Личный VPN на Railway для Outline Client</b>\n\n"
-        "1. В Railway открой <b>Settings → Networking → TCP Proxy</b>.\n"
-        f"2. Укажи внутренний порт <code>{ss.port}</code>.\n"
-        "3. Сделай redeploy, чтобы появились переменные "
-        "<code>RAILWAY_TCP_PROXY_DOMAIN</code> и <code>RAILWAY_TCP_PROXY_PORT</code>.\n"
-        "4. Нажми <b>📋 Мой Outline-ключ</b> и вставь ключ в Outline Client.\n\n"
-        "Это Outline-compatible Shadowsocks-сервер через Railway TCP Proxy. "
-        "Публичный UDP на Railway обычно недоступен, поэтому режим рассчитан на TCP-трафик."
-    )
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await guard(update):
+def stop_proc(proc: Optional[subprocess.Popen]) -> None:
+    if not proc or proc.poll() is not None:
         return
+
     try:
-        ss.start()
-    except Exception as e:
-        await send_or_edit(update, f"⚠️ VPN-сервер не запустился:\n<code>{html.escape(str(e))}</code>", main_keyboard())
-        return
-    owner_note = "\n\n✅ Ты назначен владельцем этого бота." if not ADMIN_IDS and update.effective_user and update.effective_user.id in store.state.owners else ""
-    await send_or_edit(
-        update,
-        f"✅ <b>Outline-compatible VPN запущен</b>\nВерсия: <code>{VERSION}</code>{owner_note}",
-        main_keyboard(),
-    )
-
-
-async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await guard(update):
-        return
-    await show_key(update, rotate=False)
-
-
-async def cmd_new_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await guard(update):
-        return
-    await show_key(update, rotate=True)
-
-
-async def show_key(update: Update, rotate: bool = False) -> None:
-    try:
-        if rotate:
-            ss.rotate_and_restart()
-        else:
-            ss.start()
-        key = ss.access_key()
-        title = "🔑 <b>Новый Outline-ключ создан</b>" if rotate else "📋 <b>Твой Outline-ключ</b>"
-        await send_or_edit(
-            update,
-            f"{title}\n\n<code>{html.escape(key)}</code>\n\n"
-            "Вставь этот ключ в приложение <b>Outline Client</b>.",
-            main_keyboard(),
-        )
-    except Exception as e:
-        await send_or_edit(update, f"⚠️ Не удалось выдать ключ:\n<code>{html.escape(str(e))}</code>", main_keyboard())
-
-
-async def show_status(update: Update) -> None:
-    running = ss.is_running()
-    host, port = ss.public_endpoint()
-    uptime = int(time.time() - STARTED_AT)
-    endpoint = f"{host}:{port}" if host and port else "TCP Proxy ещё не настроен"
-    railway_internal = tcp_proxy_internal_port()
-    warnings: list[str] = []
-    if railway_internal and railway_internal != ss.port:
-        warnings.append(
-            f"⚠️ Railway TCP Proxy смотрит на внутренний порт {railway_internal}, "
-            f"а ss-server слушает {ss.port}. В Networking → TCP Proxy поставь {ss.port} или измени SS_PORT."
-        )
-    if not host or not port:
-        warnings.append("⚠️ Нет публичного TCP endpoint. Включи TCP Proxy и сделай redeploy.")
-    try:
-        key_hint = ss.access_key()[:18] + "…"
+        proc.terminate()
+        proc.wait(timeout=5)
     except Exception:
-        key_hint = "нет"
-    text = (
-        "📊 <b>Статус VPN</b>\n\n"
-        f"Версия: <code>{VERSION}</code>\n"
-        f"VPN-процесс: <code>{'работает' if running else 'остановлен'}</code>\n"
-        f"Внутренний порт ss-server: <code>{ss.port}</code>\n"
-        f"Внутренний порт Railway TCP Proxy: <code>{railway_internal or 'нет'}</code>\n"
-        f"Публичный endpoint: <code>{html.escape(endpoint)}</code>\n"
-        f"Метод: <code>{html.escape(ss.method)}</code>\n"
-        f"UDP: <code>{'включён' if ss.enable_udp else 'выключен'}</code>\n"
-        f"Ключ: <code>{html.escape(key_hint)}</code>\n"
-        f"Uptime бота: <code>{uptime} сек.</code>"
-    )
-    if warnings:
-        text += "\n\n" + "\n".join(html.escape(w) for w in warnings)
-    await send_or_edit(update, text, main_keyboard())
-
-
-async def show_debug(update: Update) -> None:
-    running = ss.is_running()
-    host, port = ss.public_endpoint()
-    endpoint = f"{host}:{port}" if host and port else "нет"
-    debug = (
-        "🛠 <b>Debug</b>\n\n"
-        f"VPN-процесс: <code>{'работает' if running else 'остановлен'}</code>\n"
-        f"SS_PORT: <code>{ss.port}</code>\n"
-        f"RAILWAY_TCP_APPLICATION_PORT: <code>{html.escape(getenv('RAILWAY_TCP_APPLICATION_PORT') or 'нет')}</code>\n"
-        f"RAILWAY_TCP_PROXY_DOMAIN: <code>{html.escape(getenv('RAILWAY_TCP_PROXY_DOMAIN') or 'нет')}</code>\n"
-        f"RAILWAY_TCP_PROXY_PORT: <code>{html.escape(getenv('RAILWAY_TCP_PROXY_PORT') or 'нет')}</code>\n"
-        f"SS_PUBLIC_HOST: <code>{html.escape(getenv('SS_PUBLIC_HOST') or 'нет')}</code>\n"
-        f"SS_PUBLIC_PORT: <code>{html.escape(getenv('SS_PUBLIC_PORT') or 'нет')}</code>\n"
-        f"Endpoint в ключе: <code>{html.escape(endpoint)}</code>\n\n"
-        "<b>Последние строки ss-server:</b>\n"
-        f"<code>{html.escape(tail_file(ss.log_path, 20))}</code>"
-    )
-    await send_or_edit(update, debug, main_keyboard())
-
-
-async def do_ping(update: Update) -> None:
-    started = time.perf_counter()
-    running = ss.is_running()
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    text = (
-        "🏓 <b>Ping</b>\n\n"
-        f"Ответ бота: <code>{elapsed_ms:.2f} ms</code>\n"
-        f"Версия: <code>{VERSION}</code>\n"
-        f"VPN: <code>{'работает' if running else 'остановлен'}</code>"
-    )
-    await send_or_edit(update, text, main_keyboard())
-
-
-async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.callback_query:
-        return
-    await update.callback_query.answer()
-    if not await guard(update):
-        return
-    data = update.callback_query.data
-    if data == "new_key":
-        await show_key(update, rotate=True)
-    elif data == "my_key":
-        await show_key(update, rotate=False)
-    elif data == "status":
-        await show_status(update)
-    elif data == "ping":
-        await do_ping(update)
-    elif data == "restart_vpn":
         try:
-            ss.restart()
-            await send_or_edit(update, "🔁 <b>VPN-процесс перезапущен.</b>", main_keyboard())
-        except Exception as e:
-            await send_or_edit(update, f"⚠️ Не удалось перезапустить VPN:\n<code>{html.escape(str(e))}</code>", main_keyboard())
-    elif data == "restart_container":
-        await send_or_edit(update, "♻️ <b>Контейнер перезапускается...</b>", None)
-        asyncio.create_task(force_container_restart())
-    elif data == "debug":
-        await show_debug(update)
-    elif data == "help":
-        await send_or_edit(update, help_text(), main_keyboard())
+            proc.kill()
+        except Exception:
+            pass
 
 
-async def force_container_restart() -> None:
-    await asyncio.sleep(1.0)
-    # Non-zero exit makes Railway restart the service instead of treating it as a completed worker.
-    os._exit(1)
+def start_services() -> None:
+    global ss_proc, nginx_proc
+
+    write_runtime_files()
+
+    stop_proc(ss_proc)
+    stop_proc(nginx_proc)
+
+    SS_LOG.write_text("", "utf-8")
+    NGINX_LOG.write_text("", "utf-8")
+
+    ss_log = open(SS_LOG, "ab", buffering=0)
+    nginx_log = open(NGINX_LOG, "ab", buffering=0)
+
+    ss_proc = subprocess.Popen(
+        ["outline-ss-server", f"-config={SERVER_CONFIG}"],
+        stdout=ss_log,
+        stderr=subprocess.STDOUT,
+    )
+
+    nginx_proc = subprocess.Popen(
+        ["nginx", "-c", str(NGINX_CONFIG), "-p", "/tmp"],
+        stdout=nginx_log,
+        stderr=subprocess.STDOUT,
+    )
+
+    time.sleep(1)
 
 
-async def post_init(app: Application) -> None:
-    # Start the VPN process when the bot starts, so the TCP proxy is ready even before a button is pressed.
-    ss.start()
+def ensure_services() -> None:
+    global ss_proc, nginx_proc
+
+    if ss_proc is None or ss_proc.poll() is not None:
+        start_services()
+        return
+
+    if nginx_proc is None or nginx_proc.poll() is not None:
+        start_services()
+        return
 
 
-def main() -> None:
-    token = getenv("BOT_TOKEN")
-    if not token:
-        print("BOT_TOKEN is required", file=sys.stderr)
-        sys.exit(1)
+def rotate_key() -> None:
+    state = load_state()
+    state["password"] = _rand_password()
+    state["secret_path"] = _rand_path()
+    save_state(state)
+    start_services()
 
-    app = Application.builder().token(token).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("key", cmd_key))
-    app.add_handler(CommandHandler("newkey", cmd_new_key))
-    app.add_handler(CommandHandler("debug", show_debug))
-    app.add_handler(CallbackQueryHandler(callback))
-    print(f"Starting bot version {VERSION}. Shadowsocks internal port: {ss.port}", flush=True)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def tail(path: Path, n: int = 25) -> str:
+    if not path.exists():
+        return "нет лога"
+
+    lines = path.read_text("utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-n:]) if lines else "лог пуст"
+
+
+def keyboard() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("🌐 Мой WS-ключ")
+    kb.row("📋 YAML", "📊 Статус")
+    kb.row("🛠 Debug", "🔁 Рестарт WS")
+    kb.row("🔑 Создать / обновить ключ")
+    kb.row("❓ Инструкция")
+    return kb
+
+
+def code(text: str) -> str:
+    return f"<pre>{html.escape(text)}</pre>"
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    ensure_services()
+
+    text = (
+        "🌐 <b>Outline WebSocket VPN</b>\n\n"
+        f"Версия: {VERSION}\n"
+        "Режим: Shadowsocks-over-WebSocket\n\n"
+        "TCP идёт через:\n"
+        "wss://.../tcp\n\n"
+        "UDP/DNS идёт через:\n"
+        "wss://.../udp\n\n"
+        "Нажми <b>🌐 Мой WS-ключ</b> и добавь его в Outline Client."
+    )
+
+    bot.send_message(message.chat.id, text, reply_markup=keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "🌐 Мой WS-ключ")
+def ws_key(message):
+    ensure_services()
+
+    state = load_state()
+    key = dynamic_key(state)
+
+    warn = ""
+    if not PUBLIC_HOST:
+        warn = (
+            "\n\n⚠️ Нет RAILWAY_PUBLIC_DOMAIN.\n"
+            "В Railway включи Settings → Networking → Public Networking → Generate Domain."
+        )
+
+    text = (
+        "🌐 <b>Dynamic Outline key</b>\n\n"
+        + code(key)
+        + "\nДобавь этот ключ через <b>+</b> в Outline Client.\n"
+        "Нужен Outline Client 1.15.0+."
+        + warn
+    )
+
+    bot.send_message(message.chat.id, text, reply_markup=keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 YAML")
+def show_yaml(message):
+    ensure_services()
+
+    yaml_text = build_client_yaml(load_state())
+    bot.send_message(
+        message.chat.id,
+        "📋 <b>Client YAML</b>\n\n" + code(yaml_text),
+        reply_markup=keyboard(),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 Статус")
+def status(message):
+    ensure_services()
+
+    state = load_state()
+
+    ss_status = "работает" if ss_proc and ss_proc.poll() is None else "остановлен"
+    nginx_status = "работает" if nginx_proc and nginx_proc.poll() is None else "остановлен"
+
+    host = PUBLIC_HOST or "HOST"
+
+    text = f"""📊 <b>Статус VPN</b>
+
+Версия: {VERSION}
+Режим: Shadowsocks-over-WebSocket
+
+Public host: {PUBLIC_HOST or 'нет'}
+Public port: {PUBLIC_PORT}
+outline-ss-server: {ss_status}
+nginx: {nginx_status}
+
+TCP endpoint:
+wss://{host}/{state['secret_path']}/tcp
+
+UDP/DNS endpoint:
+wss://{host}/{state['secret_path']}/udp
+
+Dynamic key:
+{dynamic_key(state)}
+"""
+
+    bot.send_message(message.chat.id, text, reply_markup=keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "🛠 Debug")
+def debug(message):
+    ensure_services()
+
+    state = load_state()
+
+    ss_pid = ss_proc.pid if ss_proc and ss_proc.poll() is None else "нет"
+    nginx_pid = nginx_proc.pid if nginx_proc and nginx_proc.poll() is None else "нет"
+
+    debug_text = f"""🛠 Debug
+
+VERSION={VERSION}
+MODE=websocket
+
+PUBLIC_HOST={PUBLIC_HOST or 'нет'}
+PORT={PUBLIC_PORT}
+OUTLINE_WS_PORT={OUTLINE_WS_PORT}
+
+RAILWAY_PUBLIC_DOMAIN={os.getenv('RAILWAY_PUBLIC_DOMAIN', 'нет')}
+RAILWAY_TCP_PROXY_DOMAIN={os.getenv('RAILWAY_TCP_PROXY_DOMAIN', 'нет')}
+RAILWAY_TCP_PROXY_PORT={os.getenv('RAILWAY_TCP_PROXY_PORT', 'нет')}
+
+secret_path=/{state['secret_path']}
+dynamic_key={dynamic_key(state)}
+
+ss_pid={ss_pid}
+nginx_pid={nginx_pid}
+
+--- outline-ss-server log ---
+{tail(SS_LOG, 25)}
+
+--- nginx log ---
+{tail(NGINX_LOG, 25)}
+"""
+
+    bot.send_message(message.chat.id, code(debug_text), reply_markup=keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "🔁 Рестарт WS")
+def restart(message):
+    start_services()
+    bot.send_message(message.chat.id, "🔁 WebSocket VPN перезапущен", reply_markup=keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "🔑 Создать / обновить ключ")
+def update_key(message):
+    rotate_key()
+
+    state = load_state()
+    key = dynamic_key(state)
+
+    text = (
+        "🔑 Новый WS-ключ создан.\n\n"
+        "Старый сервер в Outline нужно удалить и добавить этот ключ заново:\n\n"
+        + code(key)
+    )
+
+    bot.send_message(message.chat.id, text, reply_markup=keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "❓ Инструкция")
+def instructions(message):
+    text = """❓ Инструкция
+
+1. Railway → Settings → Networking → Public Networking → Generate Domain.
+2. Дождись, пока Railway создаст публичный домен.
+3. Сделай Redeploy.
+4. В Telegram нажми /start.
+5. Нажми 🌐 Мой WS-ключ.
+6. В Outline Client удали старый Railway Outline VPN.
+7. Нажми + и вставь ssconf:// ключ.
+8. Подключись.
+
+Важно:
+- TCP Proxy в этом режиме не используется.
+- Нужен Outline Client 1.15.0+.
+- Весь трафик идёт через wss:// по TCP/HTTPS.
+- Если нажал “Создать / обновить ключ”, старый сервер в Outline надо удалить и добавить новый ключ.
+"""
+
+    bot.send_message(message.chat.id, html.escape(text), reply_markup=keyboard())
+
+
+@bot.message_handler(func=lambda m: True)
+def fallback(message):
+    bot.send_message(message.chat.id, "Выбери действие на клавиатуре 👇", reply_markup=keyboard())
 
 
 if __name__ == "__main__":
-    main()
+    start_services()
+    print(f"Bot v{VERSION} started. Public host={PUBLIC_HOST or 'missing'}")
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)

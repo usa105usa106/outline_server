@@ -16,7 +16,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py ./
 
-VOLUME ["/data"]
 EXPOSE 8388/tcp
 
 CMD ["python", "bot.py"]

@@ -92,13 +92,15 @@ ENABLE_UDP=false
 
 По умолчанию Railway filesystem может быть временным. Чтобы ключ не менялся после redeploy:
 
-1. Добавь Railway Volume.
+1. Добавь Railway Volume в настройках Railway.
 2. Примонтируй его в `/data`.
 3. Оставь переменную:
 
 ```env
 STATE_PATH=/data/outline_state.json
 ```
+
+В Dockerfile специально нет команды `VOLUME`, потому что Railway её не поддерживает. Используй только Railway Volumes через интерфейс Railway.
 
 ## Проверка без Telegram
 
